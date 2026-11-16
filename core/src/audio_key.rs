@@ -191,8 +191,9 @@ const RIG_FAULT_FILE: &str = "/tmp/spoton-rig-refuse";
 
 /// The code 2 refusal to inject while `path` exists, `None` otherwise.
 #[cfg(feature = "rig-fault")]
-fn rig_fault_refusal(_path: &std::path::Path) -> Option<Error> {
-    None
+fn rig_fault_refusal(path: &std::path::Path) -> Option<Error> {
+    path.exists()
+        .then(|| AudioKeyError::AesKey(TEMPORARY_REFUSAL).into())
 }
 
 /// The shortest time between two audio key requests.
@@ -364,7 +365,10 @@ mod rig_fault_tests {
     use super::*;
 
     fn temp_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("spoton-rig-fault-test-{}-{name}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "spoton-rig-fault-test-{}-{name}",
+            std::process::id()
+        ))
     }
 
     #[test]
