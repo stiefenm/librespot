@@ -94,6 +94,9 @@ struct PlayerInternal {
     play_request_id_generator: SeqGenerator<u64>,
     last_progress_update: Instant,
 
+    /// Time and requested position of the last same-track reload that seeked.
+    last_same_track_reload: Option<(Instant, u32)>,
+
     local_file_lookup: Arc<LocalFileLookup>,
 }
 
@@ -528,6 +531,8 @@ impl Player {
                 player_id,
                 play_request_id_generator: SeqGenerator::new(0),
                 last_progress_update: Instant::now(),
+
+                last_same_track_reload: None,
 
                 local_file_lookup: Arc::new(local_file_lookup),
             };
@@ -2069,8 +2074,23 @@ impl PlayerInternal {
             if *current_track_id == track_id {
                 // we can use the current decoder. Ensure it's at the correct position.
                 if position_ms != *stream_position_ms {
-                    // This may be blocking.
-                    *stream_position_ms = decoder.seek(position_ms)?;
+                    let now = Instant::now();
+                    if same_track_reload_is_redundant(
+                        self.last_same_track_reload,
+                        now,
+                        position_ms,
+                        *stream_position_ms,
+                    ) {
+                        // A repeated load for the same target: the first one already seeked.
+                        debug!(
+                            "same-track reload: seek skipped (delta {} ms)",
+                            stream_position_ms.abs_diff(position_ms)
+                        );
+                    } else {
+                        // This may be blocking.
+                        *stream_position_ms = decoder.seek(position_ms)?;
+                        self.last_same_track_reload = Some((Instant::now(), position_ms));
+                    }
                 }
 
                 // Move the info from the current state into a PlayerLoadedTrackData so we can use
@@ -2130,6 +2150,9 @@ impl PlayerInternal {
                 }
             }
         }
+
+        // Not the track we are playing: a later same-track reload must not see an older one.
+        self.last_same_track_reload = None;
 
         // Check if the requested track has been preloaded already. If so use the preloaded data.
         if let PlayerPreload::Ready {
@@ -2728,17 +2751,28 @@ where
     }
 }
 
+/// How long after a same-track reload a repeated request for the same position counts as redundant.
+const SAME_TRACK_RELOAD_WINDOW: Duration = Duration::from_secs(2);
+/// How far the decoder may be from the requested position for the seek to be skipped.
+const SAME_TRACK_RELOAD_MAX_DELTA_MS: u32 = 1500;
+
 /// A second load of the track that is already playing, asking for the same position
 /// shortly after the first one, only repeats the seek the first one did. Spotify clients
 /// send such a pair for one tap.
-#[allow(dead_code)]
 fn same_track_reload_is_redundant(
-    _last: Option<(Instant, u32)>,
-    _now: Instant,
-    _requested_ms: u32,
-    _current_ms: u32,
+    last: Option<(Instant, u32)>,
+    now: Instant,
+    requested_ms: u32,
+    current_ms: u32,
 ) -> bool {
-    false
+    match last {
+        Some((at, last_requested_ms)) => {
+            now.saturating_duration_since(at) < SAME_TRACK_RELOAD_WINDOW
+                && last_requested_ms == requested_ms
+                && current_ms.abs_diff(requested_ms) <= SAME_TRACK_RELOAD_MAX_DELTA_MS
+        }
+        None => false,
+    }
 }
 
 #[cfg(test)]
