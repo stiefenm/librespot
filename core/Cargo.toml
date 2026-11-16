@@ -13,6 +13,11 @@ build = "build.rs"
 # Refer to the workspace Cargo.toml for the list of features
 default = ["native-tls"]
 
+# Test builds only: while /tmp/spoton-rig-refuse exists, every audio key request is
+# answered with a code 2 refusal so the back-off of audio_key.rs can be exercised on
+# a rig. Not in default; a shipped binary must not contain it.
+rig-fault = []
+
 # TLS backends (mutually exclusive - see oauth/src/lib.rs for compile-time checks)
 # Note: Validation is in oauth since it's compiled first in the dependency tree.
 native-tls = [

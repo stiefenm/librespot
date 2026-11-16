@@ -133,6 +133,12 @@ impl AudioKeyManager {
         const KEY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
         const MAX_RETRIES: u32 = 2;
 
+        #[cfg(feature = "rig-fault")]
+        if let Some(refusal) = rig_fault_refusal(std::path::Path::new(RIG_FAULT_FILE)) {
+            warn!("rig-fault: refusing audio key (code 2)");
+            return Err(refusal);
+        }
+
         // The sequence number of the attempt in flight, so that an attempt
         // that timed out can be dropped from the pending requests.
         let seq_in_flight = AtomicU32::new(0);
@@ -176,6 +182,17 @@ impl AudioKeyManager {
 
         self.session().send_packet(PacketType::RequestKey, data)
     }
+}
+
+/// Test builds only (feature `rig-fault`): while this file exists, every audio key
+/// request is refused with code 2 before it is sent.
+#[cfg(feature = "rig-fault")]
+const RIG_FAULT_FILE: &str = "/tmp/spoton-rig-refuse";
+
+/// The code 2 refusal to inject while `path` exists, `None` otherwise.
+#[cfg(feature = "rig-fault")]
+fn rig_fault_refusal(_path: &std::path::Path) -> Option<Error> {
+    None
 }
 
 /// The shortest time between two audio key requests.
@@ -340,6 +357,33 @@ where
 
     error!("Audio key request failed after {attempts} attempts");
     Err(AudioKeyError::Timeout.into())
+}
+
+#[cfg(all(test, feature = "rig-fault"))]
+mod rig_fault_tests {
+    use super::*;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("spoton-rig-fault-test-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn rig_fault_refuses_while_file_exists() {
+        let path = temp_path("exists");
+        std::fs::write(&path, b"").expect("create the marker file");
+        let refusal = rig_fault_refusal(&path);
+        std::fs::remove_file(&path).expect("remove the marker file");
+        let refusal = refusal.expect("a refusal while the file exists");
+        // The refusal must be the temporary one the pacer backs off on.
+        assert!(is_temporary_refusal(&refusal));
+    }
+
+    #[test]
+    fn rig_fault_silent_without_file() {
+        let path = temp_path("absent");
+        let _ = std::fs::remove_file(&path);
+        assert!(rig_fault_refusal(&path).is_none());
+    }
 }
 
 #[cfg(test)]
