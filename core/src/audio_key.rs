@@ -1,4 +1,13 @@
-use std::{collections::HashMap, future::Future, io::Write, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    io::Write,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering as AtomicOrdering},
+    },
+    time::Duration,
+};
 
 use byteorder::{BigEndian, ByteOrder, WriteBytesExt};
 use bytes::Bytes;
@@ -124,35 +133,38 @@ impl AudioKeyManager {
         const KEY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
         const MAX_RETRIES: u32 = 2;
 
-        for attempt in 0..=MAX_RETRIES {
-            let (tx, rx) = oneshot::channel();
+        // The sequence number of the attempt in flight, so that an attempt
+        // that timed out can be dropped from the pending requests.
+        let seq_in_flight = AtomicU32::new(0);
 
-            let seq = self.lock(move |inner| {
-                let seq = inner.sequence.get();
-                inner.pending.insert(seq, tx);
-                seq
-            });
+        retry_on_timeout(
+            MAX_RETRIES + 1,
+            KEY_RESPONSE_TIMEOUT,
+            || {
+                let (tx, rx) = oneshot::channel();
 
-            self.send_key_request(seq, track, file)?;
+                let seq = self.lock(move |inner| {
+                    let seq = inner.sequence.get();
+                    inner.pending.insert(seq, tx);
+                    seq
+                });
+                seq_in_flight.store(seq, AtomicOrdering::Relaxed);
 
-            match tokio::time::timeout(KEY_RESPONSE_TIMEOUT, rx).await {
-                Ok(result) => return result?,
-                Err(_) => {
-                    self.lock(|inner| inner.pending.remove(&seq));
-                    warn!(
-                        "Audio key response timeout (attempt {}/{})",
-                        attempt + 1,
-                        MAX_RETRIES + 1
-                    );
+                let sent = self.send_key_request(seq, track, file);
+                async move {
+                    sent?;
+                    rx.await?
                 }
-            }
-        }
-
-        error!(
-            "Audio key request failed after {} attempts",
-            MAX_RETRIES + 1
-        );
-        Err(AudioKeyError::Timeout.into())
+            },
+            || {
+                self.lock(|inner| {
+                    inner
+                        .pending
+                        .remove(&seq_in_flight.load(AtomicOrdering::Relaxed))
+                });
+            },
+        )
+        .await
     }
 
     fn send_key_request(&self, seq: u32, track: SpotifyId, file: FileId) -> Result<(), Error> {
@@ -310,21 +322,24 @@ impl KeyPacer {
 async fn retry_on_timeout<T, Fut>(
     attempts: u32,
     timeout: Duration,
-    mut attempt: impl FnMut() -> Fut,
+    mut attempt_once: impl FnMut() -> Fut,
     mut on_timeout: impl FnMut(),
 ) -> Result<T, Error>
 where
     Fut: Future<Output = Result<T, Error>>,
 {
-    // Stub: one attempt only.
-    let _ = attempts;
-    match tokio::time::timeout(timeout, attempt()).await {
-        Ok(result) => result,
-        Err(_) => {
-            on_timeout();
-            Err(AudioKeyError::Timeout.into())
+    for attempt in 1..=attempts {
+        match tokio::time::timeout(timeout, attempt_once()).await {
+            Ok(result) => return result,
+            Err(_) => {
+                on_timeout();
+                warn!("Audio key response timeout (attempt {attempt}/{attempts})");
+            }
         }
     }
+
+    error!("Audio key request failed after {attempts} attempts");
+    Err(AudioKeyError::Timeout.into())
 }
 
 #[cfg(test)]
