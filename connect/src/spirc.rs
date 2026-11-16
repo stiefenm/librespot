@@ -1946,12 +1946,12 @@ fn paused_event_status(current: &SpircPlayStatus, new_position_ms: u32) -> Optio
     match current {
         SpircPlayStatus::Paused { .. }
         | SpircPlayStatus::Playing { .. }
-        | SpircPlayStatus::LoadingPlay { .. }
         | SpircPlayStatus::LoadingPause { .. } => Some(SpircPlayStatus::Paused {
             position_ms: new_position_ms,
             preloading_of_next_track_triggered: false,
         }),
-        SpircPlayStatus::Stopped => None,
+        // play was already issued and Playing follows; a Paused here is stale
+        SpircPlayStatus::LoadingPlay { .. } | SpircPlayStatus::Stopped => None,
     }
 }
 
