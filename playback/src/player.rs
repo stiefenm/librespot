@@ -2728,6 +2728,63 @@ where
     }
 }
 
+/// A second load of the track that is already playing, asking for the same position
+/// shortly after the first one, only repeats the seek the first one did. Spotify clients
+/// send such a pair for one tap.
+#[allow(dead_code)]
+fn same_track_reload_is_redundant(
+    _last: Option<(Instant, u32)>,
+    _now: Instant,
+    _requested_ms: u32,
+    _current_ms: u32,
+) -> bool {
+    false
+}
+
+#[cfg(test)]
+mod same_track_reload_tests {
+    use super::same_track_reload_is_redundant;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn second_reload_same_target_within_window_is_redundant() {
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_millis(500);
+        assert!(same_track_reload_is_redundant(Some((t0, 0)), now, 0, 30));
+    }
+
+    #[test]
+    fn reload_after_window_is_not_redundant() {
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_millis(2100);
+        assert!(!same_track_reload_is_redundant(Some((t0, 0)), now, 0, 30));
+    }
+
+    #[test]
+    fn reload_to_other_position_is_not_redundant() {
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_millis(500);
+        assert!(!same_track_reload_is_redundant(
+            Some((t0, 0)),
+            now,
+            60000,
+            30
+        ));
+    }
+
+    #[test]
+    fn reload_far_from_target_is_not_redundant() {
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_millis(500);
+        assert!(!same_track_reload_is_redundant(Some((t0, 0)), now, 0, 1600));
+    }
+
+    #[test]
+    fn first_reload_is_not_redundant() {
+        assert!(!same_track_reload_is_redundant(None, Instant::now(), 0, 30));
+    }
+}
+
 #[cfg(test)]
 mod abandoned_load_tests {
     use super::unless_abandoned;
