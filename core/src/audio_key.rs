@@ -302,6 +302,31 @@ impl KeyPacer {
     }
 }
 
+/// Runs `attempt` up to `attempts` times, giving each `timeout` to answer.
+/// An answer, whether a key or a refusal, ends the loop at once. After each
+/// attempt that timed out `on_timeout` runs, to drop what the attempt left
+/// pending, and once the last one timed out the result is
+/// [`AudioKeyError::Timeout`].
+async fn retry_on_timeout<T, Fut>(
+    attempts: u32,
+    timeout: Duration,
+    mut attempt: impl FnMut() -> Fut,
+    mut on_timeout: impl FnMut(),
+) -> Result<T, Error>
+where
+    Fut: Future<Output = Result<T, Error>>,
+{
+    // Stub: one attempt only.
+    let _ = attempts;
+    match tokio::time::timeout(timeout, attempt()).await {
+        Ok(result) => result,
+        Err(_) => {
+            on_timeout();
+            Err(AudioKeyError::Timeout.into())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -594,5 +619,80 @@ mod tests {
 
         assert!(timeout.is_err());
         assert!(!pacer.is_backing_off());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_retry_makes_three_attempts_then_times_out() {
+        let calls = AtomicUsize::new(0);
+        let cleanups = AtomicUsize::new(0);
+
+        let result: Result<AudioKey, Error> = retry_on_timeout(
+            3,
+            Duration::from_millis(1500),
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::pending()
+            },
+            || {
+                cleanups.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(cleanups.load(Ordering::SeqCst), 3);
+        let error = result.expect_err("every attempt timed out");
+        assert!(matches!(
+            error.error.downcast_ref::<AudioKeyError>(),
+            Some(AudioKeyError::Timeout)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_retry_returns_the_first_answer() {
+        let calls = AtomicUsize::new(0);
+
+        let result = retry_on_timeout(
+            3,
+            Duration::from_millis(1500),
+            || {
+                let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                async move {
+                    if n == 2 {
+                        Ok(KEY)
+                    } else {
+                        std::future::pending().await
+                    }
+                }
+            },
+            || {},
+        )
+        .await;
+
+        assert_eq!(result.expect("the second attempt answers").0, KEY.0);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_retry_passes_a_refusal_through_without_retry() {
+        let calls = AtomicUsize::new(0);
+        let cleanups = AtomicUsize::new(0);
+
+        let result: Result<AudioKey, Error> = retry_on_timeout(
+            3,
+            Duration::from_millis(1500),
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Err(AudioKeyError::AesKey(TEMPORARY_REFUSAL).into()) }
+            },
+            || {
+                cleanups.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cleanups.load(Ordering::SeqCst), 0);
+        assert!(is_temporary_refusal(&result.expect_err("a refusal")));
     }
 }
