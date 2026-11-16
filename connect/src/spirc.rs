@@ -862,24 +862,13 @@ impl SpircTask {
                 ..
             } => {
                 trace!("==> Paused");
-                match self.play_status {
-                    SpircPlayStatus::Paused { .. } | SpircPlayStatus::Playing { .. } => {
+                match paused_event_status(&self.play_status, new_position_ms) {
+                    Some(paused) => {
                         self.connect_state
                             .update_position(new_position_ms, self.now_ms());
-                        self.play_status = SpircPlayStatus::Paused {
-                            position_ms: new_position_ms,
-                            preloading_of_next_track_triggered: false,
-                        };
+                        self.play_status = paused;
                     }
-                    SpircPlayStatus::LoadingPlay { .. } | SpircPlayStatus::LoadingPause { .. } => {
-                        self.connect_state
-                            .update_position(new_position_ms, self.now_ms());
-                        self.play_status = SpircPlayStatus::Paused {
-                            position_ms: new_position_ms,
-                            preloading_of_next_track_triggered: false,
-                        };
-                    }
-                    _ => return Ok(()),
+                    None => return Ok(()),
                 }
             }
             PlayerEvent::Stopped { .. } => {
@@ -1949,6 +1938,58 @@ impl SpircTask {
                 self.player.emit_volume_changed_event(volume);
             }
         }
+    }
+}
+
+/// The status a `PlayerEvent::Paused` leads to, or `None` when the status stays as it is.
+fn paused_event_status(current: &SpircPlayStatus, new_position_ms: u32) -> Option<SpircPlayStatus> {
+    match current {
+        SpircPlayStatus::Paused { .. }
+        | SpircPlayStatus::Playing { .. }
+        | SpircPlayStatus::LoadingPlay { .. }
+        | SpircPlayStatus::LoadingPause { .. } => Some(SpircPlayStatus::Paused {
+            position_ms: new_position_ms,
+            preloading_of_next_track_triggered: false,
+        }),
+        SpircPlayStatus::Stopped => None,
+    }
+}
+
+#[cfg(test)]
+mod paused_event_tests {
+    use super::{SpircPlayStatus, paused_event_status};
+
+    #[test]
+    fn loading_play_ignores_paused_event() {
+        let status = SpircPlayStatus::LoadingPlay { position_ms: 10000 };
+        assert!(paused_event_status(&status, 10500).is_none());
+    }
+
+    #[test]
+    fn loading_pause_takes_paused_event() {
+        let status = SpircPlayStatus::LoadingPause { position_ms: 10000 };
+        assert!(matches!(
+            paused_event_status(&status, 10500),
+            Some(SpircPlayStatus::Paused {
+                position_ms: 10500,
+                preloading_of_next_track_triggered: false,
+            })
+        ));
+    }
+
+    #[test]
+    fn playing_takes_paused_event() {
+        let status = SpircPlayStatus::Playing {
+            nominal_start_time: 0,
+            preloading_of_next_track_triggered: false,
+        };
+        assert!(matches!(
+            paused_event_status(&status, 10500),
+            Some(SpircPlayStatus::Paused {
+                position_ms: 10500,
+                ..
+            })
+        ));
     }
 }
 
