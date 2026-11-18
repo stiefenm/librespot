@@ -39,7 +39,7 @@ use std::{
     future::Future,
     sync::Arc,
     sync::atomic::{AtomicUsize, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::{sync::mpsc, time::sleep};
@@ -111,6 +111,10 @@ struct SpircTask {
     /// when no other future resolves, otherwise resets the delay
     update_state: bool,
 
+    /// the last activation of this device and whether Spotify has registered it yet,
+    /// see [cluster_update_verdict]
+    activation: Option<Activation>,
+
     spirc_id: usize,
 }
 
@@ -145,6 +149,9 @@ const CONTEXT_FETCH_THRESHOLD: usize = 2;
 const VOLUME_UPDATE_DELAY: Duration = Duration::from_millis(500);
 // to reduce updates to remote, we group some request by waiting for a set amount of time
 const UPDATE_STATE_DELAY: Duration = Duration::from_millis(200);
+// how long after an activation a cluster push naming another device is still taken as older
+// than the activation, when Spotify has not registered the activation yet
+const ACTIVATION_PENDING_MAX: Duration = Duration::from_millis(3000);
 
 /// The spotify connect handle
 pub struct Spirc {
@@ -261,6 +268,7 @@ impl Spirc {
             transfer_state: None,
             update_volume: false,
             update_state: false,
+            activation: None,
 
             spirc_id,
         };
@@ -1006,17 +1014,44 @@ impl SpircTask {
         );
 
         if let Some(cluster) = cluster_update.cluster.take() {
-            let became_inactive = self.connect_state.is_active()
-                && cluster.active_device_id != self.session.device_id();
-            if became_inactive {
-                info!("device became inactive");
-                self.handle_disconnect().await?;
-                self.handle_stop();
-            } else if self.connect_state.is_active() {
-                // fixme: workaround fix, because of missing information why it behaves like it does
-                //  background: when another device sends a connect-state update, some player's position de-syncs
-                //  tried: providing session_id, playback_id, track-metadata "track_player"
-                self.update_state = true;
+            let now = Instant::now();
+            let verdict = cluster_update_verdict(
+                self.connect_state.is_active(),
+                self.session.device_id(),
+                &cluster.active_device_id,
+                cluster.server_timestamp_ms,
+                &mut self.activation,
+                now,
+            );
+            match verdict {
+                ClusterVerdict::BecameInactive => {
+                    info!("device became inactive");
+                    self.handle_disconnect().await?;
+                    self.handle_stop();
+                }
+                ClusterVerdict::StaleIgnored => {
+                    // the push is older than our own activation, so it must not end the session;
+                    // put the active state again
+                    let (since_ms, registered) = match self.activation {
+                        Some(a) => (
+                            now.saturating_duration_since(a.at).as_millis(),
+                            a.registered_stamp_ms.is_some(),
+                        ),
+                        None => (0, false),
+                    };
+                    info!(
+                        "stale cluster update ignored ({since_ms} ms after activation, registered {})",
+                        if registered { "yes" } else { "no" }
+                    );
+                    self.update_state = true;
+                }
+                ClusterVerdict::StillActive => {
+                    // fixme: workaround fix, because of missing information why it behaves like it does
+                    //  background: when another device sends a connect-state update, some player's position de-syncs
+                    //  tried: providing session_id, playback_id, track-metadata "track_player"
+                    self.update_state = true;
+                }
+                ClusterVerdict::NotActive => {}
             }
         } else if self.connect_state.is_active() {
             self.connect_state.became_inactive(&self.session).await?;
@@ -1323,6 +1358,11 @@ impl SpircTask {
     }
 
     fn handle_activate(&mut self) {
+        // the state turns active only here; Spotify has not registered it yet
+        self.activation = Some(Activation {
+            at: Instant::now(),
+            registered_stamp_ms: None,
+        });
         self.connect_state.set_active(true);
         self.player
             .emit_session_connected_event(self.session.connection_id(), self.session.username());
@@ -1915,10 +1955,20 @@ impl SpircTask {
 
         self.connect_state.set_now(self.now_ms() as u64);
 
-        self.connect_state
-            .send_state(&self.session)
-            .await
-            .map(|_| ())
+        let res = self.connect_state.send_state(&self.session).await;
+        if let Ok(bytes) = &res {
+            use protobuf::Message;
+            // the answer is the cluster as Spotify sees it right after our state
+            if let Ok(cluster) = Cluster::parse_from_bytes(bytes) {
+                register_put_response(
+                    &mut self.activation,
+                    self.session.device_id(),
+                    &cluster.active_device_id,
+                    cluster.server_timestamp_ms,
+                );
+            }
+        }
+        res.map(|_| ())
     }
 
     fn set_volume(&mut self, volume: u16) {
@@ -1990,6 +2040,192 @@ mod paused_event_tests {
                 ..
             })
         ));
+    }
+}
+
+/// The last activation of this device. It is pending until Spotify has registered it:
+/// a cluster push that names another device before that is older than the activation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Activation {
+    at: Instant,
+    /// the server stamp of the first cluster that named this device after the activation
+    registered_stamp_ms: Option<i64>,
+}
+
+#[derive(Debug, PartialEq)]
+enum ClusterVerdict {
+    NotActive,
+    StillActive,
+    StaleIgnored,
+    BecameInactive,
+}
+
+/// What a cluster push means for the local active state.
+fn cluster_update_verdict(
+    is_active: bool,
+    own_device_id: &str,
+    active_device_id: &str,
+    _stamp_ms: i64,
+    _activation: &mut Option<Activation>,
+    _now: Instant,
+) -> ClusterVerdict {
+    if !is_active {
+        ClusterVerdict::NotActive
+    } else if active_device_id == own_device_id {
+        ClusterVerdict::StillActive
+    } else {
+        ClusterVerdict::BecameInactive
+    }
+}
+
+/// Registers a pending activation from the answer to our own state PUT.
+fn register_put_response(
+    _activation: &mut Option<Activation>,
+    _own_device_id: &str,
+    _active_device_id: &str,
+    _stamp_ms: i64,
+) {
+}
+
+#[cfg(test)]
+mod stale_cluster_tests {
+    use super::{
+        ACTIVATION_PENDING_MAX, Activation, ClusterVerdict, cluster_update_verdict,
+        register_put_response,
+    };
+    use std::time::{Duration, Instant};
+
+    const OWN: &str = "own-device";
+    const OTHER: &str = "other-device";
+    const REG: i64 = 1_000_000;
+
+    fn pending(t0: Instant) -> Option<Activation> {
+        Some(Activation {
+            at: t0,
+            registered_stamp_ms: None,
+        })
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn foreign_push_while_activation_pending_is_stale() {
+        let t0 = Instant::now();
+        let mut act = pending(t0);
+        let v = cluster_update_verdict(true, OWN, OTHER, 0, &mut act, t0 + ms(65));
+        assert_eq!(v, ClusterVerdict::StaleIgnored);
+    }
+
+    #[test]
+    fn empty_active_device_while_activation_pending_is_stale() {
+        let t0 = Instant::now();
+        let mut act = pending(t0);
+        let v = cluster_update_verdict(true, OWN, "", 0, &mut act, t0 + ms(65));
+        assert_eq!(v, ClusterVerdict::StaleIgnored);
+    }
+
+    #[test]
+    fn own_cluster_registers_the_activation() {
+        let t0 = Instant::now();
+        let mut act = pending(t0);
+        let v = cluster_update_verdict(true, OWN, OWN, REG, &mut act, t0 + ms(300));
+        assert_eq!(v, ClusterVerdict::StillActive);
+        assert_eq!(act.map(|a| a.registered_stamp_ms), Some(Some(REG)));
+    }
+
+    #[test]
+    fn foreign_push_after_registration_deactivates() {
+        let t0 = Instant::now();
+        let mut act = pending(t0);
+        cluster_update_verdict(true, OWN, OWN, REG, &mut act, t0 + ms(300));
+        let v = cluster_update_verdict(true, OWN, OTHER, REG, &mut act, t0 + ms(400));
+        assert_eq!(v, ClusterVerdict::BecameInactive);
+    }
+
+    #[test]
+    fn foreign_push_after_pending_bound_deactivates() {
+        let t0 = Instant::now();
+        let mut act = pending(t0);
+        let v = cluster_update_verdict(
+            true,
+            OWN,
+            OTHER,
+            0,
+            &mut act,
+            t0 + ACTIVATION_PENDING_MAX + ms(1),
+        );
+        assert_eq!(v, ClusterVerdict::BecameInactive);
+    }
+
+    #[test]
+    fn foreign_push_without_activation_record_deactivates() {
+        let mut act = None;
+        let v = cluster_update_verdict(true, OWN, OTHER, 0, &mut act, Instant::now());
+        assert_eq!(v, ClusterVerdict::BecameInactive);
+    }
+
+    #[test]
+    fn inactive_device_takes_no_verdict() {
+        let t0 = Instant::now();
+        let mut act = pending(t0);
+        let before = act;
+        assert_eq!(
+            cluster_update_verdict(false, OWN, OTHER, 0, &mut act, t0 + ms(65)),
+            ClusterVerdict::NotActive
+        );
+        assert_eq!(
+            cluster_update_verdict(false, OWN, OWN, REG, &mut act, t0 + ms(65)),
+            ClusterVerdict::NotActive
+        );
+        assert_eq!(act, before);
+    }
+
+    #[test]
+    fn older_stamped_foreign_push_after_registration_is_stale() {
+        let t0 = Instant::now();
+        let mut act = pending(t0);
+        register_put_response(&mut act, OWN, OWN, REG);
+        let v = cluster_update_verdict(true, OWN, OTHER, REG - 3000, &mut act, t0 + ms(57));
+        assert_eq!(v, ClusterVerdict::StaleIgnored);
+    }
+
+    #[test]
+    fn newer_stamped_foreign_push_after_registration_deactivates() {
+        let t0 = Instant::now();
+        let mut act = pending(t0);
+        register_put_response(&mut act, OWN, OWN, REG);
+        let v = cluster_update_verdict(true, OWN, OTHER, REG + 1, &mut act, t0 + ms(57));
+        assert_eq!(v, ClusterVerdict::BecameInactive);
+    }
+
+    #[test]
+    fn unstamped_foreign_push_after_registration_deactivates() {
+        let t0 = Instant::now();
+        let mut act = pending(t0);
+        register_put_response(&mut act, OWN, OWN, REG);
+        let v = cluster_update_verdict(true, OWN, OTHER, 0, &mut act, t0 + ms(57));
+        assert_eq!(v, ClusterVerdict::BecameInactive);
+    }
+
+    #[test]
+    fn registration_is_set_once() {
+        let t0 = Instant::now();
+        let mut act = pending(t0);
+        register_put_response(&mut act, OWN, OWN, REG);
+        register_put_response(&mut act, OWN, OWN, REG + 5000);
+        cluster_update_verdict(true, OWN, OWN, REG + 9000, &mut act, t0 + ms(500));
+        assert_eq!(act.map(|a| a.registered_stamp_ms), Some(Some(REG)));
+    }
+
+    #[test]
+    fn put_answer_naming_another_device_does_not_register() {
+        let t0 = Instant::now();
+        let mut act = pending(t0);
+        register_put_response(&mut act, OWN, OTHER, REG);
+        register_put_response(&mut act, OWN, OWN, 0);
+        assert_eq!(act, pending(t0));
     }
 }
 
