@@ -2061,30 +2061,72 @@ enum ClusterVerdict {
 }
 
 /// What a cluster push means for the local active state.
+///
+/// The local state turns active before Spotify knows about it, so a push that names another
+/// device (or none) and was produced before our activation reached Spotify must not end the
+/// session. Until the activation is registered such a push is taken as stale, for at most
+/// [ACTIVATION_PENDING_MAX]. The registration is the server stamp of the first cluster that
+/// names this device; later, a push naming another device is stale only when its server stamp
+/// is older than that. Without an activation record or without usable stamps the push is taken
+/// as a real takeover.
 fn cluster_update_verdict(
     is_active: bool,
     own_device_id: &str,
     active_device_id: &str,
-    _stamp_ms: i64,
-    _activation: &mut Option<Activation>,
-    _now: Instant,
+    stamp_ms: i64,
+    activation: &mut Option<Activation>,
+    now: Instant,
 ) -> ClusterVerdict {
     if !is_active {
-        ClusterVerdict::NotActive
-    } else if active_device_id == own_device_id {
-        ClusterVerdict::StillActive
-    } else {
-        ClusterVerdict::BecameInactive
+        return ClusterVerdict::NotActive;
+    }
+
+    if active_device_id == own_device_id {
+        if let Some(activation) = activation {
+            activation.registered_stamp_ms.get_or_insert(stamp_ms);
+        }
+        return ClusterVerdict::StillActive;
+    }
+
+    match activation {
+        None => ClusterVerdict::BecameInactive,
+        Some(Activation {
+            at,
+            registered_stamp_ms: None,
+        }) => {
+            if now.saturating_duration_since(*at) < ACTIVATION_PENDING_MAX {
+                ClusterVerdict::StaleIgnored
+            } else {
+                ClusterVerdict::BecameInactive
+            }
+        }
+        Some(Activation {
+            registered_stamp_ms: Some(registered),
+            ..
+        }) => {
+            if *registered > 0 && stamp_ms > 0 && stamp_ms < *registered {
+                ClusterVerdict::StaleIgnored
+            } else {
+                ClusterVerdict::BecameInactive
+            }
+        }
     }
 }
 
-/// Registers a pending activation from the answer to our own state PUT.
+/// Registers a pending activation from the answer to our own state PUT: only an answer that
+/// names this device and carries a server stamp registers, and only once per activation.
 fn register_put_response(
-    _activation: &mut Option<Activation>,
-    _own_device_id: &str,
-    _active_device_id: &str,
-    _stamp_ms: i64,
+    activation: &mut Option<Activation>,
+    own_device_id: &str,
+    active_device_id: &str,
+    stamp_ms: i64,
 ) {
+    if active_device_id != own_device_id || stamp_ms <= 0 {
+        return;
+    }
+    if let Some(activation) = activation {
+        activation.registered_stamp_ms.get_or_insert(stamp_ms);
+    }
 }
 
 #[cfg(test)]
