@@ -3,6 +3,7 @@ use crate::{
     context_resolver::{ContextAction, ContextResolver, ResolveContext},
     core::{
         Error, Session, SpotifyUri,
+        audio_key::DENIAL_LIMIT,
         authentication::Credentials,
         dealer::{
             manager::{BoxedStream, BoxedStreamResult, Reply, RequestReply},
@@ -891,9 +892,20 @@ impl SpircTask {
                 return Ok(());
             }
             PlayerEvent::Unavailable { track_id, .. } => {
-                self.handle_unavailable(&track_id)?;
-                if self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri() {
-                    self.handle_next(None)?
+                let denials = self.session.audio_key().consecutive_denials();
+                match unavailable_action(denials, DENIAL_LIMIT) {
+                    UnavailableAction::SkipNext => {
+                        self.handle_unavailable(&track_id)?;
+                        if self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri() {
+                            self.handle_next(None)?
+                        }
+                    }
+                    UnavailableAction::PauseKeepQueue => {
+                        // Not the stop command: it would drop the next tracks.
+                        // A Resume on the stopped player loads this track again.
+                        info!("paused after {denials} tracks with refused audio keys, queue kept");
+                        self.player.stop();
+                    }
                 }
             }
             _ => return Ok(()),
@@ -2012,8 +2024,15 @@ enum UnavailableAction {
     PauseKeepQueue,
 }
 
-fn unavailable_action(_denials: u32, _limit: u32) -> UnavailableAction {
-    UnavailableAction::SkipNext
+/// Skips to the next track after a refused key, until `limit` tracks in a
+/// row have been refused. From then on every refusal pauses, and keeps the
+/// queue.
+fn unavailable_action(denials: u32, limit: u32) -> UnavailableAction {
+    if denials >= limit {
+        UnavailableAction::PauseKeepQueue
+    } else {
+        UnavailableAction::SkipNext
+    }
 }
 
 #[cfg(test)]

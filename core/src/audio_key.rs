@@ -104,9 +104,21 @@ impl AudioKeyManager {
     /// each wait, up to seven times, about a minute, before the refusal is
     /// returned. A key that arrives ends the wait. Any other refusal is
     /// returned at once.
+    ///
+    /// The session counts the tracks in a row whose key Spotify refused with
+    /// a code other than 2 (see [`consecutive_denials`](Self::consecutive_denials)):
+    /// once per distinct track, reset by any key that arrives. From
+    /// [`DENIAL_LIMIT`] on, every further refusal logs a warning. The count
+    /// lives in this session, so a new session starts at 0.
     pub async fn request(&self, track: SpotifyId, file: FileId) -> Result<AudioKey, Error> {
         let pacer = self.pacer();
-        pacer.request(|| self.request_now(track, file)).await
+        let result = pacer.request(|| self.request_now(track, file)).await;
+        if let Some((n, code)) = pacer.note_outcome(track, &result) {
+            warn!(
+                "Spotify refused audio keys for {n} tracks in a row (code {code}), playback is paused"
+            );
+        }
+        result
     }
 
     /// Requests the audio key of `file` once, for a caller that can do
@@ -119,7 +131,8 @@ impl AudioKeyManager {
         pacer.ask(false, || self.request_now(track, file)).await
     }
 
-    /// How many tracks in a row Spotify has refused the key of.
+    /// How many tracks in a row Spotify has refused the key of, since the
+    /// last key that arrived in this session.
     pub fn consecutive_denials(&self) -> u32 {
         self.pacer().denials()
     }
@@ -231,8 +244,9 @@ const REFUSAL_BACKOFF: [Duration; 3] = [
 const REFUSAL_RETRIES: usize = 7;
 
 /// How many tracks in a row Spotify may refuse the key of before playback
-/// pauses.
-pub const DENIAL_LIMIT: u32 = 0;
+/// pauses. A refusal other than code 2 counts, once per distinct track, and
+/// only a key that arrives resets the count.
+pub const DENIAL_LIMIT: u32 = 5;
 
 /// Paces the audio key requests of a session.
 #[derive(Default)]
@@ -280,16 +294,45 @@ impl KeyPacer {
         self.backoff_until().is_some()
     }
 
-    fn denials(&self) -> u32 {
-        0
+    fn denials_guard(&self) -> std::sync::MutexGuard<'_, Denials> {
+        self.denials
+            .lock()
+            .expect("audio key denials mutex should not be poisoned")
     }
 
+    fn denials(&self) -> u32 {
+        self.denials_guard().count
+    }
+
+    /// Notes how asking for the key of `track` ended. A key that arrives
+    /// resets the count of refused tracks. A refusal with a code other than
+    /// [`TEMPORARY_REFUSAL`] counts, unless the last refused track was this
+    /// one. Everything else (code 2, a back-off, a timeout, a lost
+    /// connection) says nothing about whether Spotify refuses the account,
+    /// and leaves the count as it is. Returns the count and the refusal code
+    /// when the count is at [`DENIAL_LIMIT`] or above after a refusal.
     fn note_outcome(
         &self,
-        _track: SpotifyId,
-        _result: &Result<AudioKey, Error>,
+        track: SpotifyId,
+        result: &Result<AudioKey, Error>,
     ) -> Option<(u32, u16)> {
-        None
+        let mut denials = self.denials_guard();
+        match result {
+            Ok(_) => {
+                *denials = Denials::default();
+                None
+            }
+            Err(e) => match e.error.downcast_ref::<AudioKeyError>() {
+                Some(AudioKeyError::AesKey(code)) if *code != TEMPORARY_REFUSAL => {
+                    if denials.last != Some(track) {
+                        denials.count = denials.count.saturating_add(1);
+                        denials.last = Some(track);
+                    }
+                    (denials.count >= DENIAL_LIMIT).then_some((denials.count, *code))
+                }
+                _ => None,
+            },
+        }
     }
 
     /// Asks with `ask` until a temporary refusal has been asked again
