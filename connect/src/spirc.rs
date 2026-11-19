@@ -2168,6 +2168,15 @@ fn cluster_update_verdict(
     }
 }
 
+/// The activation record after `handle_activate`.
+fn activation_after_activate(
+    _was_active: bool,
+    current: Option<Activation>,
+    _now: Instant,
+) -> Option<Activation> {
+    current
+}
+
 /// Registers a pending activation from the answer to our own state PUT: only an answer that
 /// names this device and carries a server stamp registers, and only once per activation.
 fn register_put_response(
@@ -2187,8 +2196,8 @@ fn register_put_response(
 #[cfg(test)]
 mod stale_cluster_tests {
     use super::{
-        ACTIVATION_PENDING_MAX, Activation, ClusterVerdict, cluster_update_verdict,
-        register_put_response,
+        ACTIVATION_PENDING_MAX, Activation, ClusterVerdict, activation_after_activate,
+        cluster_update_verdict, register_put_response,
     };
     use std::time::{Duration, Instant};
 
@@ -2323,6 +2332,95 @@ mod stale_cluster_tests {
         register_put_response(&mut act, OWN, OTHER, REG);
         register_put_response(&mut act, OWN, OWN, 0);
         assert_eq!(act, pending(t0));
+    }
+
+    fn registered(t0: Instant, stamp: i64) -> Option<Activation> {
+        let mut act = pending(t0);
+        register_put_response(&mut act, OWN, OWN, stamp);
+        act
+    }
+
+    #[test]
+    fn own_cluster_without_stamp_does_not_register() {
+        let t0 = Instant::now();
+        let mut act = pending(t0);
+        for stamp in [0, -1] {
+            let v = cluster_update_verdict(true, OWN, OWN, stamp, &mut act, t0 + ms(50));
+            assert_eq!(v, ClusterVerdict::StillActive);
+            assert_eq!(act.map(|a| a.registered_stamp_ms), Some(None));
+        }
+        let v = cluster_update_verdict(true, OWN, OTHER, REG, &mut act, t0 + ms(100));
+        assert_eq!(v, ClusterVerdict::StaleIgnored);
+    }
+
+    #[test]
+    fn pending_bound_is_exclusive() {
+        let t0 = Instant::now();
+        let mut act = pending(t0);
+        let v = cluster_update_verdict(true, OWN, OTHER, 0, &mut act, t0 + ms(2999));
+        assert_eq!(v, ClusterVerdict::StaleIgnored);
+        let v = cluster_update_verdict(true, OWN, OTHER, 0, &mut act, t0 + ms(3000));
+        assert_eq!(v, ClusterVerdict::BecameInactive);
+    }
+
+    #[test]
+    fn registered_minus_one_is_stale() {
+        let t0 = Instant::now();
+        let mut act = registered(t0, REG);
+        let v = cluster_update_verdict(true, OWN, OTHER, REG - 1, &mut act, t0 + ms(57));
+        assert_eq!(v, ClusterVerdict::StaleIgnored);
+    }
+
+    #[test]
+    fn zero_registered_never_stale() {
+        let t0 = Instant::now();
+        let mut act = pending(t0);
+        cluster_update_verdict(true, OWN, OWN, 0, &mut act, t0 + ms(20));
+        let v = cluster_update_verdict(true, OWN, OTHER, 0, &mut act, t0 + ms(100));
+        assert_eq!(v, ClusterVerdict::StaleIgnored);
+        let v = cluster_update_verdict(true, OWN, OTHER, 0, &mut act, t0 + ms(3000));
+        assert_eq!(v, ClusterVerdict::BecameInactive);
+    }
+
+    #[test]
+    fn negative_stamp_deactivates() {
+        let t0 = Instant::now();
+        let mut act = registered(t0, REG);
+        let v = cluster_update_verdict(true, OWN, OTHER, -5, &mut act, t0 + ms(57));
+        assert_eq!(v, ClusterVerdict::BecameInactive);
+    }
+
+    #[test]
+    fn pending_ignores_stamp_value() {
+        let t0 = Instant::now();
+        for stamp in [5, REG, i64::MAX] {
+            let mut act = pending(t0);
+            let v = cluster_update_verdict(true, OWN, OTHER, stamp, &mut act, t0 + ms(100));
+            assert_eq!(v, ClusterVerdict::StaleIgnored);
+        }
+    }
+
+    #[test]
+    fn activate_while_active_keeps_the_registered_record() {
+        let t0 = Instant::now();
+        let record = registered(t0, REG);
+        assert_eq!(
+            activation_after_activate(true, record, t0 + ms(500)),
+            record
+        );
+    }
+
+    #[test]
+    fn activate_from_inactive_arms_a_pending_record() {
+        let t0 = Instant::now();
+        let now = t0 + ms(500);
+        assert_eq!(
+            activation_after_activate(false, registered(t0, REG), now),
+            Some(Activation {
+                at: now,
+                registered_stamp_ms: None,
+            })
+        );
     }
 }
 
