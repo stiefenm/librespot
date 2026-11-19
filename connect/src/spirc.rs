@@ -35,6 +35,7 @@ use crate::{
 };
 use futures_util::StreamExt;
 use librespot_protocol::context_page::ContextPage;
+use protobuf::Message as _;
 use protobuf::MessageField;
 use std::{
     future::Future,
@@ -113,7 +114,7 @@ struct SpircTask {
     update_state: bool,
 
     /// the last activation of this device and whether Spotify has registered it yet,
-    /// see [cluster_update_verdict]
+    /// see [judge_cluster_update]
     activation: Option<Activation>,
 
     spirc_id: usize,
@@ -957,8 +958,6 @@ impl SpircTask {
             )
         }
 
-        use protobuf::Message;
-
         match TransferState::parse_from_bytes(&cluster.transfer_data) {
             Ok(transfer_state) => self.handle_transfer(transfer_state)?,
             Err(why) => error!("failed to take over control: {why}"),
@@ -1027,7 +1026,7 @@ impl SpircTask {
 
         if let Some(cluster) = cluster_update.cluster.take() {
             let now = Instant::now();
-            let verdict = cluster_update_verdict(
+            let verdict = judge_cluster_update(
                 self.connect_state.is_active(),
                 self.session.device_id(),
                 &cluster.active_device_id,
@@ -1370,11 +1369,13 @@ impl SpircTask {
     }
 
     fn handle_activate(&mut self) {
-        // the state turns active only here; Spotify has not registered it yet
-        self.activation = Some(Activation {
-            at: Instant::now(),
-            registered_stamp_ms: None,
-        });
+        // a transition to active is not registered by Spotify yet; a Transfer while already
+        // active keeps the registered record
+        self.activation = activation_after_activate(
+            self.connect_state.is_active(),
+            self.activation,
+            Instant::now(),
+        );
         self.connect_state.set_active(true);
         self.player
             .emit_session_connected_event(self.session.connection_id(), self.session.username());
@@ -1969,15 +1970,15 @@ impl SpircTask {
 
         let res = self.connect_state.send_state(&self.session).await;
         if let Ok(bytes) = &res {
-            use protobuf::Message;
             // the answer is the cluster as Spotify sees it right after our state
-            if let Ok(cluster) = Cluster::parse_from_bytes(bytes) {
-                register_put_response(
+            match Cluster::parse_from_bytes(bytes) {
+                Ok(cluster) => register_put_response(
                     &mut self.activation,
                     self.session.device_id(),
                     &cluster.active_device_id,
                     cluster.server_timestamp_ms,
-                );
+                ),
+                Err(why) => debug!("state answer is no cluster ({} bytes): {why}", bytes.len()),
             }
         }
         res.map(|_| ())
@@ -2124,7 +2125,10 @@ enum ClusterVerdict {
 /// names this device; later, a push naming another device is stale only when its server stamp
 /// is older than that. Without an activation record or without usable stamps the push is taken
 /// as a real takeover.
-fn cluster_update_verdict(
+///
+/// Deterministic and free of I/O (time is injected), but it registers the activation as a side
+/// effect: a push that names this device registers through [register_put_response].
+fn judge_cluster_update(
     is_active: bool,
     own_device_id: &str,
     active_device_id: &str,
@@ -2137,9 +2141,7 @@ fn cluster_update_verdict(
     }
 
     if active_device_id == own_device_id {
-        if let Some(activation) = activation {
-            activation.registered_stamp_ms.get_or_insert(stamp_ms);
-        }
+        register_put_response(activation, own_device_id, active_device_id, stamp_ms);
         return ClusterVerdict::StillActive;
     }
 
@@ -2168,13 +2170,21 @@ fn cluster_update_verdict(
     }
 }
 
-/// The activation record after `handle_activate`.
+/// The activation record after `handle_activate`. Only a real transition from inactive to
+/// active arms a pending record; an activation while already active keeps what is known.
 fn activation_after_activate(
-    _was_active: bool,
+    was_active: bool,
     current: Option<Activation>,
-    _now: Instant,
+    now: Instant,
 ) -> Option<Activation> {
-    current
+    if was_active {
+        current
+    } else {
+        Some(Activation {
+            at: now,
+            registered_stamp_ms: None,
+        })
+    }
 }
 
 /// Registers a pending activation from the answer to our own state PUT: only an answer that
@@ -2197,7 +2207,7 @@ fn register_put_response(
 mod stale_cluster_tests {
     use super::{
         ACTIVATION_PENDING_MAX, Activation, ClusterVerdict, activation_after_activate,
-        cluster_update_verdict, register_put_response,
+        judge_cluster_update, register_put_response,
     };
     use std::time::{Duration, Instant};
 
@@ -2220,7 +2230,7 @@ mod stale_cluster_tests {
     fn foreign_push_while_activation_pending_is_stale() {
         let t0 = Instant::now();
         let mut act = pending(t0);
-        let v = cluster_update_verdict(true, OWN, OTHER, 0, &mut act, t0 + ms(65));
+        let v = judge_cluster_update(true, OWN, OTHER, 0, &mut act, t0 + ms(65));
         assert_eq!(v, ClusterVerdict::StaleIgnored);
     }
 
@@ -2228,7 +2238,7 @@ mod stale_cluster_tests {
     fn empty_active_device_while_activation_pending_is_stale() {
         let t0 = Instant::now();
         let mut act = pending(t0);
-        let v = cluster_update_verdict(true, OWN, "", 0, &mut act, t0 + ms(65));
+        let v = judge_cluster_update(true, OWN, "", 0, &mut act, t0 + ms(65));
         assert_eq!(v, ClusterVerdict::StaleIgnored);
     }
 
@@ -2236,7 +2246,7 @@ mod stale_cluster_tests {
     fn own_cluster_registers_the_activation() {
         let t0 = Instant::now();
         let mut act = pending(t0);
-        let v = cluster_update_verdict(true, OWN, OWN, REG, &mut act, t0 + ms(300));
+        let v = judge_cluster_update(true, OWN, OWN, REG, &mut act, t0 + ms(300));
         assert_eq!(v, ClusterVerdict::StillActive);
         assert_eq!(act.map(|a| a.registered_stamp_ms), Some(Some(REG)));
     }
@@ -2245,8 +2255,8 @@ mod stale_cluster_tests {
     fn foreign_push_after_registration_deactivates() {
         let t0 = Instant::now();
         let mut act = pending(t0);
-        cluster_update_verdict(true, OWN, OWN, REG, &mut act, t0 + ms(300));
-        let v = cluster_update_verdict(true, OWN, OTHER, REG, &mut act, t0 + ms(400));
+        judge_cluster_update(true, OWN, OWN, REG, &mut act, t0 + ms(300));
+        let v = judge_cluster_update(true, OWN, OTHER, REG, &mut act, t0 + ms(400));
         assert_eq!(v, ClusterVerdict::BecameInactive);
     }
 
@@ -2254,7 +2264,7 @@ mod stale_cluster_tests {
     fn foreign_push_after_pending_bound_deactivates() {
         let t0 = Instant::now();
         let mut act = pending(t0);
-        let v = cluster_update_verdict(
+        let v = judge_cluster_update(
             true,
             OWN,
             OTHER,
@@ -2268,7 +2278,7 @@ mod stale_cluster_tests {
     #[test]
     fn foreign_push_without_activation_record_deactivates() {
         let mut act = None;
-        let v = cluster_update_verdict(true, OWN, OTHER, 0, &mut act, Instant::now());
+        let v = judge_cluster_update(true, OWN, OTHER, 0, &mut act, Instant::now());
         assert_eq!(v, ClusterVerdict::BecameInactive);
     }
 
@@ -2278,11 +2288,11 @@ mod stale_cluster_tests {
         let mut act = pending(t0);
         let before = act;
         assert_eq!(
-            cluster_update_verdict(false, OWN, OTHER, 0, &mut act, t0 + ms(65)),
+            judge_cluster_update(false, OWN, OTHER, 0, &mut act, t0 + ms(65)),
             ClusterVerdict::NotActive
         );
         assert_eq!(
-            cluster_update_verdict(false, OWN, OWN, REG, &mut act, t0 + ms(65)),
+            judge_cluster_update(false, OWN, OWN, REG, &mut act, t0 + ms(65)),
             ClusterVerdict::NotActive
         );
         assert_eq!(act, before);
@@ -2293,7 +2303,7 @@ mod stale_cluster_tests {
         let t0 = Instant::now();
         let mut act = pending(t0);
         register_put_response(&mut act, OWN, OWN, REG);
-        let v = cluster_update_verdict(true, OWN, OTHER, REG - 3000, &mut act, t0 + ms(57));
+        let v = judge_cluster_update(true, OWN, OTHER, REG - 3000, &mut act, t0 + ms(57));
         assert_eq!(v, ClusterVerdict::StaleIgnored);
     }
 
@@ -2302,7 +2312,7 @@ mod stale_cluster_tests {
         let t0 = Instant::now();
         let mut act = pending(t0);
         register_put_response(&mut act, OWN, OWN, REG);
-        let v = cluster_update_verdict(true, OWN, OTHER, REG + 1, &mut act, t0 + ms(57));
+        let v = judge_cluster_update(true, OWN, OTHER, REG + 1, &mut act, t0 + ms(57));
         assert_eq!(v, ClusterVerdict::BecameInactive);
     }
 
@@ -2311,7 +2321,7 @@ mod stale_cluster_tests {
         let t0 = Instant::now();
         let mut act = pending(t0);
         register_put_response(&mut act, OWN, OWN, REG);
-        let v = cluster_update_verdict(true, OWN, OTHER, 0, &mut act, t0 + ms(57));
+        let v = judge_cluster_update(true, OWN, OTHER, 0, &mut act, t0 + ms(57));
         assert_eq!(v, ClusterVerdict::BecameInactive);
     }
 
@@ -2321,7 +2331,7 @@ mod stale_cluster_tests {
         let mut act = pending(t0);
         register_put_response(&mut act, OWN, OWN, REG);
         register_put_response(&mut act, OWN, OWN, REG + 5000);
-        cluster_update_verdict(true, OWN, OWN, REG + 9000, &mut act, t0 + ms(500));
+        judge_cluster_update(true, OWN, OWN, REG + 9000, &mut act, t0 + ms(500));
         assert_eq!(act.map(|a| a.registered_stamp_ms), Some(Some(REG)));
     }
 
@@ -2345,11 +2355,11 @@ mod stale_cluster_tests {
         let t0 = Instant::now();
         let mut act = pending(t0);
         for stamp in [0, -1] {
-            let v = cluster_update_verdict(true, OWN, OWN, stamp, &mut act, t0 + ms(50));
+            let v = judge_cluster_update(true, OWN, OWN, stamp, &mut act, t0 + ms(50));
             assert_eq!(v, ClusterVerdict::StillActive);
             assert_eq!(act.map(|a| a.registered_stamp_ms), Some(None));
         }
-        let v = cluster_update_verdict(true, OWN, OTHER, REG, &mut act, t0 + ms(100));
+        let v = judge_cluster_update(true, OWN, OTHER, REG, &mut act, t0 + ms(100));
         assert_eq!(v, ClusterVerdict::StaleIgnored);
     }
 
@@ -2357,9 +2367,9 @@ mod stale_cluster_tests {
     fn pending_bound_is_exclusive() {
         let t0 = Instant::now();
         let mut act = pending(t0);
-        let v = cluster_update_verdict(true, OWN, OTHER, 0, &mut act, t0 + ms(2999));
+        let v = judge_cluster_update(true, OWN, OTHER, 0, &mut act, t0 + ms(2999));
         assert_eq!(v, ClusterVerdict::StaleIgnored);
-        let v = cluster_update_verdict(true, OWN, OTHER, 0, &mut act, t0 + ms(3000));
+        let v = judge_cluster_update(true, OWN, OTHER, 0, &mut act, t0 + ms(3000));
         assert_eq!(v, ClusterVerdict::BecameInactive);
     }
 
@@ -2367,7 +2377,7 @@ mod stale_cluster_tests {
     fn registered_minus_one_is_stale() {
         let t0 = Instant::now();
         let mut act = registered(t0, REG);
-        let v = cluster_update_verdict(true, OWN, OTHER, REG - 1, &mut act, t0 + ms(57));
+        let v = judge_cluster_update(true, OWN, OTHER, REG - 1, &mut act, t0 + ms(57));
         assert_eq!(v, ClusterVerdict::StaleIgnored);
     }
 
@@ -2375,10 +2385,10 @@ mod stale_cluster_tests {
     fn zero_registered_never_stale() {
         let t0 = Instant::now();
         let mut act = pending(t0);
-        cluster_update_verdict(true, OWN, OWN, 0, &mut act, t0 + ms(20));
-        let v = cluster_update_verdict(true, OWN, OTHER, 0, &mut act, t0 + ms(100));
+        judge_cluster_update(true, OWN, OWN, 0, &mut act, t0 + ms(20));
+        let v = judge_cluster_update(true, OWN, OTHER, 0, &mut act, t0 + ms(100));
         assert_eq!(v, ClusterVerdict::StaleIgnored);
-        let v = cluster_update_verdict(true, OWN, OTHER, 0, &mut act, t0 + ms(3000));
+        let v = judge_cluster_update(true, OWN, OTHER, 0, &mut act, t0 + ms(3000));
         assert_eq!(v, ClusterVerdict::BecameInactive);
     }
 
@@ -2386,7 +2396,7 @@ mod stale_cluster_tests {
     fn negative_stamp_deactivates() {
         let t0 = Instant::now();
         let mut act = registered(t0, REG);
-        let v = cluster_update_verdict(true, OWN, OTHER, -5, &mut act, t0 + ms(57));
+        let v = judge_cluster_update(true, OWN, OTHER, -5, &mut act, t0 + ms(57));
         assert_eq!(v, ClusterVerdict::BecameInactive);
     }
 
@@ -2395,7 +2405,7 @@ mod stale_cluster_tests {
         let t0 = Instant::now();
         for stamp in [5, REG, i64::MAX] {
             let mut act = pending(t0);
-            let v = cluster_update_verdict(true, OWN, OTHER, stamp, &mut act, t0 + ms(100));
+            let v = judge_cluster_update(true, OWN, OTHER, stamp, &mut act, t0 + ms(100));
             assert_eq!(v, ClusterVerdict::StaleIgnored);
         }
     }
