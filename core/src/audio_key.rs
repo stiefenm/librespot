@@ -119,6 +119,11 @@ impl AudioKeyManager {
         pacer.ask(false, || self.request_now(track, file)).await
     }
 
+    /// How many tracks in a row Spotify has refused the key of.
+    pub fn consecutive_denials(&self) -> u32 {
+        self.pacer().denials()
+    }
+
     /// Whether the session is waiting after a refused key before it asks
     /// for another.
     pub fn is_backing_off(&self) -> bool {
@@ -225,6 +230,10 @@ const REFUSAL_BACKOFF: [Duration; 3] = [
 /// about 40.
 const REFUSAL_RETRIES: usize = 7;
 
+/// How many tracks in a row Spotify may refuse the key of before playback
+/// pauses.
+pub const DENIAL_LIMIT: u32 = 0;
+
 /// Paces the audio key requests of a session.
 #[derive(Default)]
 struct KeyPacer {
@@ -232,6 +241,13 @@ struct KeyPacer {
     /// when the last one was sent.
     turn: Mutex<Option<Instant>>,
     backoff: std::sync::Mutex<Backoff>,
+    denials: std::sync::Mutex<Denials>,
+}
+
+#[derive(Default)]
+struct Denials {
+    count: u32,
+    last: Option<SpotifyId>,
 }
 
 #[derive(Default)]
@@ -262,6 +278,18 @@ impl KeyPacer {
 
     fn is_backing_off(&self) -> bool {
         self.backoff_until().is_some()
+    }
+
+    fn denials(&self) -> u32 {
+        0
+    }
+
+    fn note_outcome(
+        &self,
+        _track: SpotifyId,
+        _result: &Result<AudioKey, Error>,
+    ) -> Option<(u32, u16)> {
+        None
     }
 
     /// Asks with `ask` until a temporary refusal has been asked again
@@ -757,5 +785,112 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(cleanups.load(Ordering::SeqCst), 0);
         assert!(is_temporary_refusal(&result.expect_err("a refusal")));
+    }
+
+    fn track(n: u128) -> SpotifyId {
+        SpotifyId { id: n }
+    }
+
+    fn refused(code: u16) -> Result<AudioKey, Error> {
+        Err(AudioKeyError::AesKey(code).into())
+    }
+
+    #[test]
+    fn denials_count_distinct_tracks_up_to_the_limit() {
+        let pacer = KeyPacer::default();
+        for n in 1..=4 {
+            assert_eq!(pacer.note_outcome(track(n), &refused(1)), None);
+            assert_eq!(pacer.denials(), n as u32);
+        }
+        assert_eq!(pacer.note_outcome(track(5), &refused(1)), Some((5, 1)));
+        assert_eq!(pacer.denials(), 5);
+    }
+
+    #[test]
+    fn a_repeated_denial_of_one_track_counts_once() {
+        let pacer = KeyPacer::default();
+        for _ in 0..3 {
+            pacer.note_outcome(track(1), &refused(1));
+        }
+        assert_eq!(pacer.denials(), 1);
+
+        let pacer = KeyPacer::default();
+        pacer.note_outcome(track(1), &refused(1));
+        pacer.note_outcome(track(2), &refused(1));
+        pacer.note_outcome(track(1), &refused(1));
+        assert_eq!(pacer.denials(), 3);
+    }
+
+    #[test]
+    fn code_two_neither_counts_nor_resets_the_denials() {
+        let pacer = KeyPacer::default();
+        for n in 1..=3 {
+            pacer.note_outcome(track(n), &refused(1));
+        }
+        assert_eq!(
+            pacer.note_outcome(track(4), &refused(TEMPORARY_REFUSAL)),
+            None
+        );
+        assert_eq!(pacer.denials(), 3);
+    }
+
+    #[test]
+    fn a_timeout_neither_counts_nor_resets_the_denials() {
+        let pacer = KeyPacer::default();
+        for n in 1..=3 {
+            pacer.note_outcome(track(n), &refused(1));
+        }
+        let timeout: Result<AudioKey, Error> = Err(AudioKeyError::Timeout.into());
+        let channel: Result<AudioKey, Error> = Err(AudioKeyError::Channel.into());
+        let backing_off: Result<AudioKey, Error> = Err(AudioKeyError::BackingOff.into());
+        assert_eq!(pacer.note_outcome(track(4), &timeout), None);
+        assert_eq!(pacer.note_outcome(track(4), &channel), None);
+        assert_eq!(pacer.note_outcome(track(4), &backing_off), None);
+        assert_eq!(pacer.denials(), 3);
+    }
+
+    #[test]
+    fn a_key_that_arrives_resets_the_denials() {
+        let pacer = KeyPacer::default();
+        for n in 1..=5 {
+            pacer.note_outcome(track(n), &refused(1));
+        }
+        assert_eq!(pacer.denials(), 5);
+        assert_eq!(pacer.note_outcome(track(9), &Ok(KEY)), None);
+        assert_eq!(pacer.denials(), 0);
+        pacer.note_outcome(track(1), &refused(1));
+        assert_eq!(pacer.denials(), 1);
+    }
+
+    #[test]
+    fn the_denials_stay_at_the_limit_until_a_key_arrives() {
+        let pacer = KeyPacer::default();
+        for n in 1..=5 {
+            pacer.note_outcome(track(n), &refused(1));
+        }
+        assert_eq!(pacer.note_outcome(track(5), &refused(1)), Some((5, 1)));
+        assert_eq!(pacer.denials(), 5);
+        assert_eq!(pacer.note_outcome(track(6), &refused(1)), Some((6, 1)));
+        assert_eq!(pacer.denials(), 6);
+    }
+
+    #[test]
+    fn the_denial_marker_is_due_only_at_or_above_the_limit() {
+        let pacer = KeyPacer::default();
+        for n in 1..=4 {
+            assert_eq!(pacer.note_outcome(track(n), &refused(1)), None);
+        }
+        assert_eq!(pacer.note_outcome(track(5), &refused(1)), Some((5, 1)));
+        assert_eq!(pacer.note_outcome(track(6), &refused(3)), Some((6, 3)));
+    }
+
+    #[test]
+    fn a_new_pacer_starts_without_denials() {
+        assert_eq!(KeyPacer::default().denials(), 0);
+    }
+
+    #[test]
+    fn the_denial_limit_is_five() {
+        assert_eq!(DENIAL_LIMIT, 5);
     }
 }

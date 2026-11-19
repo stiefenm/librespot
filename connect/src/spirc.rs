@@ -2005,6 +2005,42 @@ fn paused_event_status(current: &SpircPlayStatus, new_position_ms: u32) -> Optio
     }
 }
 
+/// What to do with a track whose key Spotify refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnavailableAction {
+    SkipNext,
+    PauseKeepQueue,
+}
+
+fn unavailable_action(_denials: u32, _limit: u32) -> UnavailableAction {
+    UnavailableAction::SkipNext
+}
+
+#[cfg(test)]
+mod key_denial_tests {
+    use super::{UnavailableAction, unavailable_action};
+
+    #[test]
+    fn below_the_denial_limit_skips_to_the_next_track() {
+        assert_eq!(unavailable_action(0, 5), UnavailableAction::SkipNext);
+        assert_eq!(unavailable_action(4, 5), UnavailableAction::SkipNext);
+    }
+
+    #[test]
+    fn at_the_denial_limit_pauses_and_keeps_the_queue() {
+        assert_eq!(unavailable_action(5, 5), UnavailableAction::PauseKeepQueue);
+    }
+
+    #[test]
+    fn above_the_denial_limit_still_pauses() {
+        assert_eq!(unavailable_action(6, 5), UnavailableAction::PauseKeepQueue);
+        assert_eq!(
+            unavailable_action(u32::MAX, 5),
+            UnavailableAction::PauseKeepQueue
+        );
+    }
+}
+
 #[cfg(test)]
 mod paused_event_tests {
     use super::{SpircPlayStatus, paused_event_status};
