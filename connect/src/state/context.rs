@@ -101,6 +101,12 @@ impl ConnectState {
     }
 
     pub fn reset_context(&mut self, mut reset_as: ResetContext) {
+        // a transfer or play command sets up a new context, a skip owed for the one before
+        // does not carry over; shuffle and repeat only reset the index
+        if !matches!(reset_as, ResetContext::DefaultIndex) {
+            self.owed_skip = None;
+        }
+
         if matches!(reset_as, ResetContext::WhenDifferent(ctx) if self.different_context_uri(ctx)) {
             reset_as = ResetContext::Completely
         }

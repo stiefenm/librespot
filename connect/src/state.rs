@@ -114,6 +114,9 @@ pub(super) struct ConnectState {
     request: PutStateRequest,
 
     unavailable_uri: Vec<String>,
+    /// play request and uri of a title the player gave up while the context its skip needs
+    /// was not resolved yet, see [owe_skip_until_context](ConnectState::owe_skip_until_context)
+    owed_skip: Option<(u64, String)>,
 
     active_since: Option<SystemTime>,
     queue_count: u64,

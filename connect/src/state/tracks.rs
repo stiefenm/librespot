@@ -424,13 +424,38 @@ impl<'ct> ConnectState {
 
     /// Remembers the skip of a title the player gave up while the context the skip needs is
     /// not resolved yet. Returns `true` when the skip is owed, `false` when it can run now.
-    pub fn owe_skip_until_context(&mut self, _id: &SpotifyUri, _play_request_id: u64) -> bool {
-        false
+    ///
+    /// A transfer loads its title before the context is resolved. Without the context
+    /// [mark_unavailable](ConnectState::mark_unavailable) fails and the skip would be lost.
+    pub fn owe_skip_until_context(&mut self, id: &SpotifyUri, play_request_id: u64) -> bool {
+        if self.get_context(self.fill_up_context).is_ok() {
+            return false;
+        }
+
+        let uri = id.to_uri();
+        debug!("marking {uri} as unavailable is owed until the context is resolved");
+        self.owed_skip = Some((play_request_id, uri));
+        true
     }
 
-    /// Hands an owed skip out, once, when its context is there.
+    /// Hands an owed skip out, once, when its context is there. `None` when nothing is owed,
+    /// when the context is still missing (the skip stays owed) or when another title is the
+    /// current one by now (the skip is dropped).
     pub fn take_owed_skip(&mut self) -> Option<(u64, SpotifyUri)> {
-        None
+        self.owed_skip.as_ref()?;
+        if self.get_context(self.fill_up_context).is_err() {
+            return None;
+        }
+
+        let (play_request_id, uri) = self.owed_skip.take()?;
+        if self.current_track(|t| t.uri != uri) {
+            debug!("dropping the owed skip of {uri}, another title is current");
+            return None;
+        }
+
+        SpotifyUri::from_uri(&uri)
+            .ok()
+            .map(|id| (play_request_id, id))
     }
 
     pub fn add_to_queue(&mut self, mut track: ProvidedTrack, rev_update: bool) {

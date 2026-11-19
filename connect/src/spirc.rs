@@ -668,6 +668,10 @@ impl SpircTask {
             false
         };
 
+        if update_state {
+            self.dispatch_owed_skip();
+        }
+
         // Fire set queue event if context was successfully loaded
         if update_state {
             self.emit_set_queue_event();
@@ -896,6 +900,16 @@ impl SpircTask {
                 let denials = self.session.audio_key().consecutive_denials();
                 match unavailable_action(denials, DENIAL_LIMIT) {
                     UnavailableAction::SkipNext => {
+                        // A transfer loads its title before the context is resolved. The
+                        // skip needs that context, so it is owed until the resolver is
+                        // done and this event is dispatched again (dispatch_owed_skip).
+                        let play_request_id = self.play_request_id.unwrap_or_default();
+                        if self
+                            .connect_state
+                            .owe_skip_until_context(&track_id, play_request_id)
+                        {
+                            return Ok(());
+                        }
                         self.handle_unavailable(&track_id)?;
                         if self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri() {
                             self.handle_next(None)?
@@ -1743,6 +1757,21 @@ impl SpircTask {
         self.handle_preload_next_track();
 
         Ok(())
+    }
+
+    // A title the player gave up before the context of its transfer was resolved still owes
+    // its skip. Its event is dispatched again: the play request is checked once more and the
+    // limit of refused tracks decides between the skip and the pause.
+    fn dispatch_owed_skip(&mut self) {
+        if let Some((play_request_id, track_id)) = self.connect_state.take_owed_skip() {
+            let owed = PlayerEvent::Unavailable {
+                play_request_id,
+                track_id,
+            };
+            if let Err(why) = self.handle_player_event(owed) {
+                error!("could not dispatch the owed skip: {why}");
+            }
+        }
     }
 
     fn add_autoplay_resolving_when_required(&mut self) {
