@@ -936,4 +936,21 @@ mod tests {
     fn the_denial_limit_is_five() {
         assert_eq!(DENIAL_LIMIT, 5);
     }
+
+    // A skip that is owed until the context of a transfer is there must not count its title
+    // twice: asked for once or asked for again before the skip runs, it is one refused title,
+    // and the limit is reached with the fifth distinct one.
+    #[test]
+    fn an_owed_skip_counts_its_title_as_one_denial() {
+        let pacer = KeyPacer::default();
+        assert_eq!(pacer.note_outcome(track(1), &refused(1)), None);
+        assert_eq!(pacer.note_outcome(track(1), &refused(1)), None);
+        assert_eq!(pacer.denials(), 1);
+        for n in 2..=4 {
+            assert_eq!(pacer.note_outcome(track(n), &refused(1)), None);
+        }
+        assert_eq!(pacer.denials(), 4);
+        assert_eq!(pacer.note_outcome(track(5), &refused(1)), Some((5, 1)));
+        assert_eq!(pacer.denials(), 5);
+    }
 }

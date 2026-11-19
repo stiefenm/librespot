@@ -2020,7 +2020,7 @@ fn paused_event_status(current: &SpircPlayStatus, new_position_ms: u32) -> Optio
 
 /// What to do with a track whose key Spotify refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UnavailableAction {
+pub(super) enum UnavailableAction {
     SkipNext,
     PauseKeepQueue,
 }
@@ -2028,7 +2028,7 @@ enum UnavailableAction {
 /// Skips to the next track after a refused key, until `limit` tracks in a
 /// row have been refused. From then on every refusal pauses, and keeps the
 /// queue.
-fn unavailable_action(denials: u32, limit: u32) -> UnavailableAction {
+pub(super) fn unavailable_action(denials: u32, limit: u32) -> UnavailableAction {
     if denials >= limit {
         UnavailableAction::PauseKeepQueue
     } else {
